@@ -48,6 +48,11 @@ export const GATE_OUTCOMES = {
     summary: 'the reviewer declined to review',
     fix: 're-run the review; if it declines again, review the change natively',
   },
+  cyber_policy_refused: {
+    state: 'unavailable', anchor: 'outside-review-cyber-policy',
+    summary: 'OpenAI declined the review under its cyber-security policy (cyber_policy)',
+    fix: "do not send the same brief to another OpenAI model: rerun it on GPT-6 Astra with the read-only correctness brief, or on Gemini 4 Carbon unchanged. Capy's /ship does this once by itself; when every attempt is refused, the second-family read is missing and the PR body says so (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-cyber-policy)",
+  },
   truncated: {
     state: 'unavailable', anchor: 'outside-review-truncated',
     summary: 'the reviewer hit its output token limit and the response is cut off',
@@ -58,9 +63,14 @@ export const GATE_OUTCOMES = {
     summary: 'the response lacks the markers this gate requires',
     fix: 're-run the review; a response without its required markers never counts as a pass',
   },
+  missing_verdict: {
+    state: 'ran', anchor: 'outside-review-missing-verdict',
+    summary: 'the review does not end with the required VERDICT: CLEAN or VERDICT: FINDINGS line',
+    fix: 'read the full reply above and decide; it is not a pass. Re-run the review from current skills, whose prompts ask for that line (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-missing-verdict)',
+  },
   untagged_review: {
     state: 'ran', anchor: 'outside-review-unverified',
-    summary: 'the review completed without severity tags or an explicit no-findings line',
+    summary: 'the review reports findings without a readable severity tag',
     fix: 'read the output above and decide; it is not a pass',
   },
   unparsed_severity: {

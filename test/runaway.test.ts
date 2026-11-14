@@ -33,10 +33,14 @@ const FOUN4 = {
     task(132, 'Targeted money reader on #501 at 7ed85c37', 374220),
   ],
 };
+const FOUN4_STANDING = { ...FOUN4, standing: true, pull_requests: [], pull_requests_total: 0 };
 
 describe('gstack-runaway scan', () => {
   test('FOUN-4: own tokens and age rotate, the reused /ship subagent is flagged, review rounds counted per PR', () => {
-    const r = run('scan', '--thread', write('foun4.json', FOUN4), '--now', NOW);
+    const crew = run('scan', '--thread', write('foun4-crew.json', FOUN4), '--now', NOW).out;
+    expect(crew).not.toContain('ROTATE');
+    expect(crew).toContain('FLAG: CHECK_IN own_tokens 6.06B > 1.00B (upper bound)');
+    const r = run('scan', '--thread', write('foun4.json', FOUN4_STANDING), '--now', NOW);
     expect(r.code).toBe(0);
     expect(r.out).toContain('RUNAWAY: thread=FOUN-4 verdict=ROTATE');
     expect(r.out).toMatch(/own=6\.06B\(upper\)/);
@@ -57,7 +61,7 @@ describe('gstack-runaway scan', () => {
   });
 
   test('DEFER holds a rotation and a stop of the mid-/ship subagent itself; stopping another subagent goes ahead', () => {
-    const doc = { code: 'GSTA-9', status: 'working', created_at: '2026-11-03T10:00:00Z', cost: { tokens: 300e6 },
+    const doc = { code: 'GSTA-9', status: 'working', created_at: '2026-11-03T10:00:00Z', cost: { tokens: 300e6 }, standing: true, pull_requests: [],
       tasks: [task(3, 'gate fix lane', 150e6, 'idle'), task(4, 'ship 1 outside-voice (#535)', 2e6, 'working')] };
     const other = run('scan', '--thread', write('defer.json', doc), '--now', NOW);
     expect(other.out).toContain('verdict=STOP');
@@ -78,7 +82,7 @@ describe('gstack-runaway scan', () => {
   });
 
   test('active means working, waiting, or a turn in the last 24 hours; an old quiet thread is not rotated', () => {
-    const base = { code: 'HARN-11', created_at: '2026-10-25T00:00:00Z', cost: { tokens: 10e6 }, tasks: [] };
+    const base = { code: 'HARN-11', created_at: '2026-10-25T00:00:00Z', cost: { tokens: 10e6 }, tasks: [], standing: true, pull_requests: [] };
     const idleRecent = run('scan', '--thread', write('idle-recent.json', { ...base, status: 'idle', updated_at: '2026-11-03T21:50:00Z' }), '--now', NOW);
     expect(idleRecent.out).toContain('active=yes');
     expect(idleRecent.out).toContain('FLAG: ROTATE age 9.9d > 3d and active');
@@ -112,8 +116,59 @@ describe('gstack-runaway scan', () => {
     expect(r.out).toContain('FLAG: WARN empty_wake 65% of 31 turns > 25%');
   });
 
+  const at = (s: number) => new Date(Date.parse('2026-11-06T12:00:00Z') + s * 1000).toISOString();
+  const wait = (s: number, input: Record<string, unknown>) => ({ source: 'tool', tool: 'wait', input: { text: JSON.stringify({ description: 'w', ...input }) }, createdAt: at(s) });
+  const work = (s: number) => ({ source: 'tool', tool: 'execute', calls: [{ tool: 'bash' }, { tool: 'edit' }], createdAt: at(s) });
+  const scan = (items: unknown[], name: string) => {
+    const doc = { code: 'GSTA-999', status: 'idle', created_at: '2026-11-06T02:00:00Z', cost: { tokens: 1e6 }, tasks: [] };
+    return run('scan', '--thread', write(name + '.json', doc), '--events', write(name + '.events.json', { items, cursor: null }), '--now', NOW).out;
+  };
+
+  // Value: protects=warm-wait check-ins (crew/docs/captain.md Warm waits, #4060) are not empty wakes: a turn whose only call re-issues the
+  //   wait on the same operation, or a 240 s timer, inside 30 minutes of the wait that began the run is left out; a re-wait past 30
+  //   minutes, a different wait, or a turn that also reads status still counts; fails_when=/runaway-stopper flags a lane that follows the
+  //   rule (GST-1597); seam=emptyWakes; no_claim=whether the lane should have warm-waited at all
+  test('warm-wait check-ins inside 30 minutes are not empty wakes; past the window they count again', () => {
+    const lane: unknown[] = [];
+    for (let k = 0; k < 20; k++) { lane.push(work(k * 2000)); lane.push(wait(k * 2000 + 1, { operation_ids: ['op' + k], duration_seconds: 240 })); for (let c = 1; c <= 7; c++) lane.push(wait(k * 2000 + 1 + c * 240, c % 2 ? { duration_seconds: 240 } : { operation_ids: ['op' + k] })); }
+    expect(scan(lane, 'warm')).toContain('empty_wake=0%/20');
+    const late: unknown[] = [];
+    for (let k = 0; k < 20; k++) { late.push(work(k * 4000)); late.push(wait(k * 4000 + 1, { operation_ids: ['op' + k] })); late.push(wait(k * 4000 + 1 + 1900, { operation_ids: ['op' + k] })); }
+    expect(scan(late, 'late')).toContain('empty_wake=50%/40');
+    const other: unknown[] = [];
+    for (let k = 0; k < 20; k++) { other.push(work(k * 2000)); other.push(wait(k * 2000 + 1, { operation_ids: ['op' + k] })); other.push(wait(k * 2000 + 241, { operation_ids: ['other' + k], duration_seconds: 600 })); }
+    expect(scan(other, 'other')).toContain('empty_wake=50%/40');
+    const reads: unknown[] = [];
+    for (let k = 0; k < 20; k++) { reads.push(work(k * 2000)); reads.push(wait(k * 2000 + 1, { operation_ids: ['op' + k] })); reads.push({ source: 'tool', tool: 'execute', calls: [{ tool: 'subagent_list' }], createdAt: at(k * 2000 + 241) }); reads.push(wait(k * 2000 + 242, { operation_ids: ['op' + k] })); }
+    expect(scan(reads, 'reads')).toContain('empty_wake=50%/40');
+    const chain: unknown[] = [work(0), wait(1, { operation_ids: ['op'], duration_seconds: 240 })];
+    for (let c = 1; c <= 60; c++) chain.push(wait(1 + c * 240, { operation_ids: ['op'], duration_seconds: 240 }));
+    expect(scan(chain, 'chain')).toContain('FLAG: WARN empty_wake 100% of 40 turns > 25%');
+  });
+
+  // Value: protects=a 240 s timer chains only on the run's operations or none, and a counted turn that re-waits on the run's operation
+  //   keeps the run's start, so polling one operation for hours with a status read every 28 minutes still counts; fails_when=a timer
+  //   naming other operations is left out, or a status-read turn restarts the 30-minute window (GST-1597 /ship findings 2 and 3);
+  //   seam=emptyWakes; no_claim=how often a lane should read status
+  test('a 240 s timer on other operations counts; a status-read turn does not restart the warm window', () => {
+    const timer = (ops: (k: number) => Record<string, unknown>) => {
+      const items: unknown[] = [];
+      for (let k = 0; k < 20; k++) { items.push(work(k * 2000)); items.push(wait(k * 2000 + 1, { operation_ids: ['op' + k] })); items.push(wait(k * 2000 + 241, { ...ops(k), duration_seconds: 240 })); }
+      return items;
+    };
+    expect(scan(timer(k => ({ operation_ids: ['other' + k] })), 'timer-other')).toContain('empty_wake=50%/40');
+    expect(scan(timer(k => ({ operation_ids: ['op' + k] })), 'timer-same')).toContain('empty_wake=0%/20');
+    expect(scan(timer(() => ({})), 'timer-none')).toContain('empty_wake=0%/20');
+    const polled: unknown[] = [work(0), wait(1, { operation_ids: ['op'], duration_seconds: 240 })];
+    for (let c = 1; c <= 60; c++) {
+      if (c % 7 === 0) polled.push({ source: 'tool', tool: 'execute', calls: [{ tool: 'subagent_list' }], createdAt: at(c * 240) });
+      polled.push(wait(1 + c * 240, { operation_ids: ['op'], duration_seconds: 240 }));
+    }
+    expect(scan(polled, 'polled')).toContain('FLAG: WARN empty_wake 100% of 40 turns > 25%');
+  });
+
   test('a subagent.list file replaces thread.get tasks: own sums top-level paths only, truncation makes it an upper bound', () => {
-    const doc = { code: 'GSTA-266', status: 'working', created_at: '2026-11-03T20:00:00Z', cost: { tokens: 700e6 }, tasks: [] };
+    const doc = { code: 'GSTA-266', status: 'working', created_at: '2026-11-03T20:00:00Z', cost: { tokens: 700e6 }, tasks: [], standing: true, pull_requests: [] };
     const subs = { total: 3, tasks: [
       { path: '1', title: 'build', status: 'done', cost: { tokens: 150e6, credits: 1 } },
       { path: '1.1', title: 'reader', status: 'done', cost: { tokens: 50e6, credits: 1 } },
@@ -130,11 +185,11 @@ describe('gstack-runaway scan', () => {
   test('--dir sweeps every thread file, largest own tokens first, with a SWEEP total', () => {
     const d = path.join(tmp, 'crew');
     fs.mkdirSync(d);
-    fs.writeFileSync(path.join(d, 'FOUN-4.thread.json'), JSON.stringify(FOUN4));
+    fs.writeFileSync(path.join(d, 'FOUN-4.thread.json'), JSON.stringify(FOUN4_STANDING));
     fs.writeFileSync(path.join(d, 'GSTA-1.thread.json'), JSON.stringify({ code: 'GSTA-1', status: 'idle', created_at: '2026-11-03T20:00:00Z', cost: { tokens: 1e6 }, tasks: [] }));
     const r = run('scan', '--dir', d, '--now', NOW);
     expect(r.out.indexOf('thread=FOUN-4')).toBeLessThan(r.out.indexOf('thread=GSTA-1'));
-    expect(r.out).toContain('SWEEP: threads=2 rotate=1 stop=0 defer=0 report=0 warn=0 look=0 ok=1 unreadable=0');
+    expect(r.out).toContain('SWEEP: threads=2 rotate=1 stop=0 defer=0 report=0 warn=0 check_in=0 look=0 ok=1 unreadable=0');
     expect(r.code).toBe(0);
   });
 
@@ -159,7 +214,7 @@ describe('gstack-runaway scan', () => {
   test('an unreadable or incomplete thread file is named, skipped and fails the sweep; the rest still scan', () => {
     const d = path.join(tmp, 'bad');
     fs.mkdirSync(d);
-    fs.writeFileSync(path.join(d, 'FOUN-4.thread.json'), JSON.stringify(FOUN4));
+    fs.writeFileSync(path.join(d, 'FOUN-4.thread.json'), JSON.stringify(FOUN4_STANDING));
     fs.writeFileSync(path.join(d, 'BAD-1.thread.json'), '{"code": "BAD-1", "cost": ');
     fs.writeFileSync(path.join(d, 'BAD-2.thread.json'), JSON.stringify({ code: 'BAD-2', status: 'working', tasks: [] }));
     fs.writeFileSync(path.join(d, 'BAD-3.thread.json'), JSON.stringify({ code: 'BAD-3', cost: { tokens: 1 }, tasks: [] }));
@@ -174,7 +229,7 @@ describe('gstack-runaway scan', () => {
     expect(r.out).toMatch(/BAD-4\.thread\.json field=tasks\[\]\.cost\.tokens expected=number/);
     expect(r.out).toMatch(/BAD-5\.thread\.json expected a tools\.thread\.get object/);
     expect(r.out).not.toContain('thread=BAD-2');
-    expect(r.out).toContain('rotate=1 stop=0 defer=0 report=0 warn=0 look=0 ok=0 unreadable=5');
+    expect(r.out).toContain('rotate=1 stop=0 defer=0 report=0 warn=0 check_in=0 look=0 ok=0 unreadable=5');
   });
 
   test('a malformed --subagents file is named as RUNAWAY_INPUT, not scanned as exact', () => {
@@ -222,6 +277,40 @@ describe('gstack-runaway scan', () => {
     expect(run('scan', '--dir', path.join(tmp, 'nope')).err).toContain('RUNAWAY_USAGE: no directory');
     expect(run('scan', '--thread', write('ok4.json', FOUN4), '--event', 'x.json').err).toContain('RUNAWAY_USAGE: unknown argument "--event"');
   });
+  // Value: protects=R70 as amended 2026-11-09 and R91: a crew thread keeps its PR to the end and checks in once at 1B own tokens; only a
+  //   standing thread with no open PR rotates; unknown PR data counts as holding one; fails_when=scan tells a Captain to rotate a crew
+  //   thread that holds an open PR (GST-2226); seam=assess via gstack-runaway scan; no_claim=whether a thread is standing (the Captain says so)
+  test('a crew thread holding a PR never rotates, checks in at 1B, and only a standing thread with no open PR rotates', () => {
+    const pr = (state: string) => ({ repo: 'garrytan/gstack', number: 4300, title: 'x', state, relation: 'owner' });
+    const base = { code: 'GSTA-500', status: 'working', created_at: '2026-11-03T10:00:00Z', tasks: [] };
+    const crew = run('scan', '--thread', write('crew-pr.json', { ...base, cost: { tokens: 600e6 }, pull_requests: [pr('open')], pull_requests_total: 1 }), '--now', NOW).out;
+    expect(crew).not.toContain('ROTATE');
+    expect(crew).not.toContain('FLAG: WARN');
+    expect(crew).toContain('verdict=OK');
+    const big = run('scan', '--thread', write('crew-big.json', { ...base, cost: { tokens: 1.1e9 }, pull_requests: [pr('open')], pull_requests_total: 1 }), '--now', NOW).out;
+    expect(big).toContain('verdict=CHECK_IN');
+    expect(big.match(/^FLAG: /gm)).toEqual(['FLAG: ']);
+    expect(big).toContain('FLAG: CHECK_IN own_tokens 1.10B > 1.00B');
+    const old = run('scan', '--thread', write('crew-old.json', { ...base, created_at: '2026-10-25T00:00:00Z', cost: { tokens: 10e6 }, pull_requests: [] }), '--now', NOW).out;
+    expect(old).toContain('verdict=OK');
+    const standing = { ...base, cost: { tokens: 600e6 }, standing: true, pull_requests: [pr('merged'), pr('closed')], pull_requests_total: 2 };
+    const s = run('scan', '--thread', write('standing.json', standing), '--now', NOW).out;
+    expect(s).toContain('verdict=ROTATE');
+    expect(s).toContain('FLAG: ROTATE own_tokens 600M > 500M');
+    const aged = run('scan', '--thread', write('standing-aged.json', { ...standing, cost: { tokens: 10e6 }, created_at: '2026-10-25T00:00:00Z' }), '--now', NOW).out;
+    expect(aged).toContain('FLAG: ROTATE age 9.9d > 3d and active');
+    expect(run('scan', '--thread', write('standing-warn.json', { ...standing, cost: { tokens: 450e6 } }), '--now', NOW).out).toContain('FLAG: WARN own_tokens 450M > 400M warn line');
+    for (const [name, prs] of [['open', { pull_requests: [pr('open')], pull_requests_total: 1 }], ['draft', { pull_requests: [pr('draft')] }],
+      ['unlisted', { pull_requests: [pr('merged')], pull_requests_total: 2 }], ['unknown', { pull_requests: undefined }]] as const) {
+      const held = run('scan', '--thread', write('standing-' + name + '.json', { ...standing, ...prs }), '--now', NOW).out;
+      expect(held).not.toContain('ROTATE');
+      expect(held).not.toContain('FLAG: WARN own_tokens');
+      expect(held).toContain('verdict=DEFER');
+      expect(held).toMatch(/DEFER: holds (an open PR|PRs it can't see); rotate after every PR merges or closes \(R91\)/);
+    }
+    const unknownCrew = run('scan', '--thread', write('crew-unknown.json', { ...base, cost: { tokens: 600e6 } }), '--now', NOW).out;
+    expect(unknownCrew).not.toContain('ROTATE');
+  });
 });
 
 describe('/runaway-stopper skill', () => {
@@ -235,10 +324,40 @@ describe('/runaway-stopper skill', () => {
     expect(skill).toContain('rm -rf');
     expect(skill).toContain('calls: i.calls?.map(c => ({ tool: c.tool }))');
   });
+  // Value: protects=the skill's fetch program keeps each wait's input, so the warm-wait exclusion runs through /runaway-stopper and not
+  //   only on hand-built files; fails_when=the projection drops input and every warm check-in counts as an empty wake (GST-1597 /ship
+  //   finding 1); seam=the template's projection run over items shaped like a tools.thread.get page (tools: true, read 2026-11-06),
+  //   then gstack-runaway scan on the file it writes
+  test('the fetch program keeps wait input, so warm check-ins on a thread.get page are left out through the skill', () => {
+    const src = skill.match(/transcript\.items\.map\((i => \(\{[\s\S]*?\}\))\)\);/)?.[1];
+    expect(src).toBeDefined();
+    const project = new Function('return ' + src)() as (i: unknown) => unknown;
+    const at = (s: number) => new Date(Date.parse('2026-11-06T12:00:00Z') + s * 1000).toISOString();
+    const text = (v: unknown) => ({ text: JSON.stringify(v), chars: JSON.stringify(v).length });
+    const waitItem = (s: number, input: Record<string, unknown>) => ({ id: 'toolu_w' + s, source: 'tool', tool: 'wait', text: 'Waiting for CI', createdAt: at(s),
+      input: text({ description: 'Waiting for CI', ...input }), result: { text: 'Waiting on 1 operation, resuming when any completes.', chars: 52, is_error: false } });
+    const page: unknown[] = [];
+    for (let k = 0; k < 20; k++) {
+      page.push({ id: 'toolu_x' + k, source: 'tool', tool: 'execute', text: 'Fix and push', createdAt: at(k * 2000),
+        calls: [{ tool: 'bash', durationMs: 700, input: text({ command: 'git push' }) }, { tool: 'edit', durationMs: 20, input: text({ path: 'a.ts' }) }], input: text({ code: '...' }) });
+      page.push(waitItem(k * 2000 + 1, { operation_ids: ['op' + k], duration_seconds: 240 }));
+      for (let c = 1; c <= 7; c++) page.push(waitItem(k * 2000 + 1 + c * 240, { operation_ids: ['op' + k], duration_seconds: 240 }));
+    }
+    const doc = { code: 'GSTA-998', status: 'idle', created_at: '2026-11-06T02:00:00Z', cost: { tokens: 1e6 }, tasks: [], events: page.map(project) };
+    const out = run('scan', '--thread', write('skill-warm.thread.json', doc), '--now', NOW).out;
+    expect(out).toContain('empty_wake=0%/20');
+    expect(out).not.toContain('FLAG: WARN empty_wake');
+  });
+  test('the fetch program marks standing threads, and only a standing thread with no open PR is rotated', () => {
+    expect(skill).toContain('content: JSON.stringify({ ...doc, events, standing: standing.includes(doc.code) })');
+    expect(skill).toContain('| `FLAG: ROTATE` | A standing thread: Step 3. |');
+    expect(skill).toContain('| `FLAG: CHECK_IN` |');
+    expect(skill).toContain('Open or unknown PRs block rotation\n(R91)');
+  });
   test('rotation stops or lists live subagents, the successor subscribes to open PRs, and archiving waits for it', () => {
     expect(skill).toContain('stop your working and waiting subagents, or list each with its run');
     expect(skill).toContain('subscribes to each open PR in the handoff');
-    expect(skill).toContain('Archive the old thread once the successor reports its subscriptions');
+    expect(skill).toContain('Leave the old thread unarchived while it holds an open PR (R91)');
     expect(fs.readFileSync(path.resolve(import.meta.dir, '..', 'runaway-stopper', 'templates', 'successor-brief.md'), 'utf8')).toContain('subscribe to every open PR');
   });
 });

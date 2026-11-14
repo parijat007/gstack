@@ -36,12 +36,14 @@ import { classifyCommandEnvironment, classifyEnvironment, environmentLine, envir
 import { checkScratch } from '../run-scratch';
 import { starterPolicy } from '../starter';
 import { isDeviceDart, listRepoFiles, readRepoFile } from '../import-graph';
+import { docsOnlyLane } from '../docs-only-lane';
 import { selectLanes, type Selection } from '../lane-selection';
 import { launchRuntime } from '../runtime';
 import { cargoModel, type CargoModel } from '../rust';
 import { adapterFor, readRange, STALL_IDLE, supervise, type Counter, type Supervised } from '../supervise';
 import { ranFiles, verifyFromRun, type RunProfile } from '../../run-evidence';
 import { matchesAny } from '../../ship-policy';
+import { testFileArgs } from '../../test-paths';
 import type { CheckDef, CheckResult, PregateContext, RemoteObligation } from '../types';
 
 /** The runner a `.py`-only selection gets; it needs the pytest module importable by python3 (`pytestMissing`). */
@@ -197,11 +199,18 @@ function importsPlaywright(text: string): boolean {
 /** Playwright's own text when its browsers are not installed on this machine. */
 const PLAYWRIGHT_NO_BROWSERS = /^.*(?:Executable doesn't exist at|download new browsers).*$/m;
 
-/** The run plan: the groups that can run, the files no runner claims, tools missing from PATH, and `.dart` files with no pubspec.yaml above. */
-export interface RunPlan { groups: RunGroup[]; unclaimed: string[]; missing: string[]; noPubspec: string[] }
+/** The run plan: the groups that can run, the files no runner claims, tools missing from PATH, `.dart` files with no pubspec.yaml above, and the files a declared runner cannot run (not run, not counted as covered). */
+export interface RunPlan { groups: RunGroup[]; unclaimed: string[]; missing: string[]; noPubspec: string[]; dropped?: string[] }
+
+/** The files a declared runner's test tool runs, by extension: JS/TS for `bun test`, `node --test`, `deno test`, vitest, jest, mocha, ava and playwright; `.py` for pytest. A tool counts as a whole command word (`./node_modules/.bin/jest` does, `tests/node/run.sh` does not). Null for any other command (a dispatcher such as `node scripts/run-tests.js` may run any language), or one naming both kinds: it takes every file. */
+function declaredRunnerFiles(runner: string): RegExp | null {
+  const js = /(?:^|[\s;&|(])(?:\S*\/)?(?:vitest|jest|mocha|ava|playwright|bun\s+test|node\s+--test|deno\s+test)(?=$|[\s;&|)])/.test(runner);
+  const py = /(?:^|[\s;&|(])(?:\S*\/)?pytest(?=$|[\s;&|)])/.test(runner);
+  return js === py ? null : js ? /\.[cm]?[jt]sx?$/ : /\.py$/;
+}
 
 /**
- * The invocations that run `files`. A declared runner takes every file. Otherwise
+ * The invocations that run `files`. A declared runner takes every file its tool runs (`declaredRunnerFiles`); the rest are `dropped`. Otherwise
  * Dart tests run from their own package root (a sub-package's imports resolve
  * against its own pubspec); Rust tests run per crate as `cargo test -p <name>`
  * from the crate's workspace root; JS/TS tests owned by a nested package that
@@ -214,7 +223,12 @@ export interface RunPlan { groups: RunGroup[]; unclaimed: string[]; missing: str
  * crate whose name Cargo would reject, no detected runner) are `unclaimed`: the lane is `incomplete`, never a pass.
  */
 export function planRuns(ctx: PregateContext, files: readonly string[]): RunPlan {
-  if (ctx.config.runner) return { groups: [{ runner: ctx.config.runner, cwd: '', files: [...files] }], unclaimed: [], missing: [], noPubspec: [] };
+  if (ctx.config.runner) {
+    const runs = declaredRunnerFiles(ctx.config.runner);
+    const taken = runs ? files.filter(f => runs.test(f)) : [...files];
+    const dropped = files.filter(f => !taken.includes(f));
+    return { groups: taken.length ? [{ runner: ctx.config.runner, cwd: '', files: taken }] : [], unclaimed: [], missing: [], noPubspec: [], ...(dropped.length ? { dropped } : {}) };
+  }
   const groups: RunGroup[] = [];
   const dart = new Map<string, string[]>();
   const cargo = new Map<string, { name: string; cwd: string; files: string[] }>();
@@ -353,7 +367,7 @@ const quote = (f: string) => `'${f.replace(/'/g, `'\\''`)}'`;
 
 async function runOnce(ctx: PregateContext, env: NodeJS.ProcessEnv, g: RunGroup, files: string[], log: string, counter: Counter): Promise<LocalRun> {
   // playwright test reads each file argument as a case-insensitive regex: escape it and anchor it to a path segment, so `a[1].spec.ts` runs that file, not `a1.spec.ts`.
-  const args = /(?<![\w-])playwright\s+test(?![\w-])/.test(g.runner) ? files.map(f => `(?:^|/)${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) : files;
+  const args = /(?<![\w-])playwright\s+test(?![\w-])/.test(g.runner) ? files.map(f => `(?:^|/)${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) : testFileArgs(g.runner, files);
   const joined = args.map(quote).join(' ');
   const run = g.runner.replace('{files}', () => joined);
   const command = g.cwd ? `(cd ${quote(g.cwd)} && ${run})` : run;
@@ -428,6 +442,7 @@ function describe(ctx: PregateContext, sel: Selection, mode: NoLaneMode): string
   for (const r of sel.removed) lines.push(`removed (no lane owed): ${r.file} — ${r.note}`);
   if (sel.emptyLane.length) lines.push(`docs/no-tests (empty lane): ${sel.emptyLane.join(' ')}`);
   if (sel.inert.length) lines.push(`no-tests (assets and tool config): ${sel.inert.join(' ')}`);
+  for (const d of sel.declaredTier) lines.push(`declared test tree ${d.glob}: ${d.tests.length} test file(s) not run in the local lane (declared [] in ${ctx.configLabel}; the repo runs them in their own tier)`);
   if (sel.stampOnly.length) lines.push(`version-stamp-only (no lane needed): ${sel.stampOnly.join(' ')} — only version values changed against the merge base; a manifest whose other content changed still needs a lane`);
   for (const r of sel.remote) lines.push(`requires-remote ${r.lane} (${r.platform}): ${r.tests.length} test(s) — ${r.tests.slice(0, 8).join(' ')}${r.tests.length > 8 ? ' …' : ''}`);
   lines.push(`Tiers ran: ${sel.tiersRan.join(' ') || '(none)'}; requires-remote: ${[...new Set(sel.remote.map(r => r.platform))].join(' ') || 'none'}`);
@@ -445,10 +460,10 @@ const GSTACK_ROOT = path.resolve(import.meta.dir, '..', '..', '..');
  */
 function remoteObligation(ctx: PregateContext, sel: Selection): RemoteObligation {
   const declared = ctx.config.remote_gate;
-  const runner = detectRunner(ctx, sel.localTests);
-  const command = declared ?? `${GSTACK_ROOT}/scripts/ubicloud/ubi-runner.sh run --src ${quote(ctx.repoRoot)} -- ${quote(runner ? runner.replace('{files}', sel.localTests.map(quote).join(' ')) : '<test runner> <selected files>')}`;
+  const runner = detectRunner(ctx, sel.gateTests);
+  const command = declared ?? `${GSTACK_ROOT}/scripts/ubicloud/ubi-runner.sh run --src ${quote(ctx.repoRoot)} -- ${quote(runner ? runner.replace('{files}', testFileArgs(runner, sel.gateTests).map(quote).join(' ')) : '<test runner> <selected files>')}`;
   const [workflow, job] = declared ? REMOTE_GATE_LANE.split('/') as [string, string] : ['test_backend', ctx.testBackend];
-  return { lane: `${workflow}/${job}`, platform: 'remote', workflow, job, tests: sel.localTests, receipt: null, command };
+  return { lane: `${workflow}/${job}`, platform: 'remote', workflow, job, tests: sel.gateTests, receipt: null, command };
 }
 
 export const REMOTE_GATE_LANE = 'pregate.json/remote_gate';
@@ -495,7 +510,7 @@ async function runRemote(ctx: PregateContext, sel: Selection, base: CheckResult)
   const log = path.join(dir, 'remote.log');
   const filesFile = path.join(dir, 'files.txt');
   fs.writeFileSync(log, '');
-  fs.writeFileSync(filesFile, sel.localTests.join('\n') + '\n');
+  fs.writeFileSync(filesFile, sel.gateTests.join('\n') + '\n');
   const r = await supervise({ command: obligation.command!, cwd: ctx.repoRoot, env: { ...ctx.env, PREGATE_TREE: ctx.wtree, PREGATE_FILES_FILE: filesFile, PREGATE_SPEND_CAP_USD: String(cap), PREGATE_TIMEOUT_S: String(Math.floor(ctx.timeoutMs / 1000)) }, log, deadline: Date.now() + ctx.timeoutMs, stallMs: 0, lastLine: true, label: `remote gate ${obligation.lane}`, progress: ctx.progress });
   const output = readRange(log, r.start, r.end);
   const reported = parseRemoteReport(output);
@@ -529,20 +544,23 @@ async function runSelected(ctx: PregateContext, sel: Selection, base: CheckResul
       : ctx.touched.length ? 'nothing touched selects a test' : 'no touched files';
     return { ...base, detail };
   }
-  if (ctx.remote && sel.localTests.length) return runRemote(ctx, sel, base);
-  const smallMachine = ctx.cores < SMALL_MACHINE_CORES && sel.localTests.length > 0 && (ctx.config.remote_gate || ctx.testBackend !== 'local');
+  if (ctx.remote && sel.gateTests.length) return runRemote(ctx, sel, base);
+  const smallMachine = ctx.cores < SMALL_MACHINE_CORES && sel.gateTests.length > 0 && (ctx.config.remote_gate || ctx.testBackend !== 'local');
   if (smallMachine) {
     const obligation = remoteObligation(ctx, sel);
     const route = obligation.lane === REMOTE_GATE_LANE && ctx.config.remote_gate_runs && ctx.ciCarry !== false
       ? `a verified CI run at this tree clears it: push, then gstack-ci-carry wait --base ${ctx.base} and rerun gstack-pregate --allow-repo-commands (a pull_request run of a branch behind its base tested the merge, another tree: dispatch the workflow on the branch); or opt in to the VM: gstack-pregate --remote --spend-cap <usd> --allow-repo-commands`
       : `run it, then ${clearHint(obligation.lane)}, or gstack-pregate --remote --spend-cap <usd> --allow-repo-commands`;
-    return { ...base, status: 'requires-remote', remote: [...sel.remote, obligation], lines: [...lines, `requires-remote ${obligation.lane}: ${ctx.cores} cores (under ${SMALL_MACHINE_CORES}); ${sel.localTests.length} local test file(s) recorded for the remote gate, not run here`, `run: ${obligation.command}`], detail: `${sel.localTests.length} local test file(s) recorded as requires-remote ${obligation.lane} (${ctx.cores} cores, under ${SMALL_MACHINE_CORES}); ${route}` };
+    return { ...base, status: 'requires-remote', remote: [...sel.remote, obligation], lines: [...lines, `requires-remote ${obligation.lane}: ${ctx.cores} cores (under ${SMALL_MACHINE_CORES}); ${sel.gateTests.length} local test file(s) recorded for the remote gate, not run here`, `run: ${obligation.command}`], detail: `${sel.gateTests.length} local test file(s) recorded as requires-remote ${obligation.lane} (${ctx.cores} cores, under ${SMALL_MACHINE_CORES}); ${route}` };
   }
   if (!ctx.allowRepoCommands) return { ...base, status: 'incomplete', code: 'REPO_COMMANDS_NOT_ALLOWED', detail: `${sel.localTests.length} local test file(s) selected but not run (pass --allow-repo-commands)`, fix: 'rerun with --allow-repo-commands (what /ship passes)' };
-  if (sel.localTests.length === 0) return { ...base, status: sel.remote.length ? 'requires-remote' : 'pass', detail: `no local lane; ${sel.remote.length} requires-remote obligation(s)` };
+  const tier = sel.declaredTier.reduce((n, d) => n + d.tests.length, 0);
+  if (sel.localTests.length === 0) return { ...base, status: sel.remote.length ? 'requires-remote' : 'pass', detail: `no local lane; ${sel.remote.length} requires-remote obligation(s)${tier ? `; ${tier} test file(s) in declared test trees not run here` : ''}` };
   // Runnable groups run even when other files are unclaimed: a real failure is reported as one, and an all-green run is still incomplete.
   const plan = planRuns(ctx, sel.localTests);
   const gap = plan.unclaimed.length ? planGap(ctx, plan, sel.localTests.length) : null;
+  const dropped = plan.dropped ? `${plan.dropped.length} selected file(s) the declared runner cannot run (not run, not counted as covered): ${plan.dropped.join(' ')}` : '';
+  if (!plan.groups.length && dropped) return { ...base, status: sel.remote.length ? 'requires-remote' : 'pass', detail: `no selected file is one the declared runner can run; ${dropped}` };
   if (!plan.groups.length) return { ...base, status: 'incomplete', ...gap, ...(gap?.environment ? { lines: [...lines, environmentLine(gap.environment)] } : {}) };
   const { groups } = plan;
   const total = groups.reduce((n, g) => n + g.files.length, 0);
@@ -550,7 +568,7 @@ async function runSelected(ctx: PregateContext, sel: Selection, base: CheckResul
   if (runtime.refusal) return { ...base, ...runtime.refusal, cause: 'environment', environment: launchCause('runtime', runtime.refusal.detail), lines: [`runtime: ${runtime.label}`, environmentLine(launchCause('runtime', runtime.refusal.detail))] };
   const r = await runLocal(ctx, runtime.env, groups);
   const adapters = [...new Set(groups.map(g => adapterFor(g.runner)).filter(Boolean))];
-  const runLines = [...lines, `runtime: ${runtime.label}`, `progress: ${adapters.join(', ') || 'none (no progress adapter for this runner; serial files and heartbeats only)'}`, `ran: ${r.command.length > 200 ? `${r.command.slice(0, 200)}…` : r.command}`, `log: ${r.log}`, ...r.tail.map(l => `  ${l}`)];
+  const runLines = [...lines, ...(dropped ? [`not run: ${dropped}`] : []), `runtime: ${runtime.label}`, `progress: ${adapters.join(', ') || 'none (no progress adapter for this runner; serial files and heartbeats only)'}`, `ran: ${r.command.length > 200 ? `${r.command.slice(0, 200)}…` : r.command}`, `log: ${r.log}`, ...r.tail.map(l => `  ${l}`)];
   const withRun = { ...base, lines: runLines, inputs: { ...inputs, command: sha256(r.command), runtime: runtime.label } };
   if (r.exit === null) {
     const why = unfinished(ctx, r, total);
@@ -568,7 +586,7 @@ async function runSelected(ctx: PregateContext, sel: Selection, base: CheckResul
     return { ...withRun, status: 'fail', cause: 'diff', code: 'PREGATE_LANE_FAILED', detail: `local lane exited ${r.exit} (${r.failed ?? '?'} failed of ${r.ran ?? '?'} ran; ${total} files; pipefail)`, fix: `read ${r.log}, fix the in-branch failure, rerun gstack-pregate --stage tests` };
   }
   if (r.ran === 0) return { ...withRun, status: 'fail', cause: 'diff', code: 'PREGATE_LANE_FAILED', detail: `ZERO-RUN: the runner reported 0 tests${r.zero ? ` in ${r.zero}` : ''} (${total} selected file(s))`, fix: 'a bad selector, a missing file or a skipped describe; exit 0 is not a pass' };
-  const detail = `${r.ran ?? 'count unavailable'} tests ran in ${total} file(s)${r.serial ? ` (${r.serial} serial)` : ''}, exit 0${sel.remote.length ? `; ${sel.remote.length} requires-remote obligation(s)` : ''}`;
+  const detail = `${r.ran ?? 'count unavailable'} tests ran in ${total} file(s)${r.serial ? ` (${r.serial} serial)` : ''}, exit 0${dropped ? `; ${dropped}` : ''}${sel.remote.length ? `; ${sel.remote.length} requires-remote obligation(s)` : ''}`;
   if (gap) return { ...withRun, status: 'incomplete', ...gap, detail: `${detail}; ${gap.detail}`, ...(gap.environment ? { lines: [...runLines, environmentLine(gap.environment)] } : {}) };
   return { ...withRun, status: sel.remote.length ? 'requires-remote' : 'pass', detail };
 }
@@ -605,12 +623,14 @@ function withNoLaneWarning(ctx: PregateContext, sel: Selection, result: CheckRes
 
 async function run(ctx: PregateContext): Promise<CheckResult> {
   const sel = selectLanes(ctx);
-  ctx.explain.push(...sel.provenance);
+  for (const line of sel.provenance) ctx.explain.push(line);
   for (const [lane, set] of Object.entries(sel.laneSets)) ctx.explain.push(`lane ${lane}: ${set === '?' ? 'file set unknown' : `${set.length} files`}`);
   const inputs = baseInputs(ctx, { selection: sha256(sel.tests.join('\n')), localTests: sha256(sel.localTests.join('\n')), remote: sha256(sel.remote.map(r => `${r.lane}:${r.tests.join(',')}`).join('\n')) });
   const declared = ctx.configKind !== 'none' && ctx.policyDeclaresLanes !== false;
   const mode: NoLaneMode = !declared ? 'no-policy' : ctx.config.warn.includes('lanes') ? 'warned' : 'strict';
   const base: CheckResult = { id: 'lanes', stage: 'tests', status: 'pass', inputs, lines: describe(ctx, sel, mode), remote: sel.remote };
+  const docs = docsOnlyLane(ctx, base);
+  if (docs) return docs;
   const lost = new Set(sel.removed.flatMap(r => r.lostCoverage)).size;
   const removedNote = sel.removed.length ? `${sel.removed.length} removed path(s)${lost ? `; ${lost} subject(s) lost their last test` : ''}` : '';
   const withRemoved = (r: CheckResult): CheckResult => (removedNote ? { ...r, detail: r.detail ? `${r.detail}; ${removedNote}` : removedNote } : r);
@@ -619,7 +639,7 @@ async function run(ctx: PregateContext): Promise<CheckResult> {
   }
   const reuse = ctx.fromRun ? fromRun(ctx, sel) : null;
   if (reuse) ctx.progress(reuse.line);
-  const rest = reuse?.passed.length ? { ...sel, localTests: sel.localTests.filter(t => !reuse.passed.includes(t)) } : sel;
+  const rest = reuse?.passed.length ? { ...sel, localTests: sel.localTests.filter(t => !reuse.passed.includes(t)), gateTests: sel.gateTests.filter(t => !reuse.passed.includes(t)) } : sel;
   const ran = await runSelected(ctx, rest, base);
   const reused = !reuse ? ran : { ...ran, lines: [reuse.line, ...(ran.lines ?? [])], ...(reuse.receipt ? { from_run: { receipt: reuse.receipt, files: reuse.passed }, detail: `${reuse.passed.length} of ${sel.localTests.length} local test file(s) passed in the --from-run run; ${ran.detail ?? ran.status}` } : {}) };
   const result = withRemoved(reused);

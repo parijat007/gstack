@@ -14,13 +14,14 @@
     "LICENSE": [],
     "licenses/**": [],
     "contrib/**": [],
-    "supabase/**": []
+    "supabase/**": [],
+    "qm/sandbox/skills/gstack-review/scripts/diff-base.sh": ["test/qm-edition.test.ts"]
   },
   "selection": {
     "free-tests.yml/free-suite": "bun run scripts/test-free-shards.ts --list"
   },
   "run_profiles": {
-    "ci-reuse/free-tests": { "workflow": "free-tests.yml", "events": ["pull_request", "workflow_dispatch"], "jobs": ["free-plan", "typecheck", "quick-bun-default", "cso-macos-launcher", "macos-named-regressions", "cso-windows-launcher", "cso-docker-integration", "free-tests"], "artifact": "tested-tree", "os": "Linux" },
+    "ci-reuse/free-tests": { "workflow": "free-tests.yml", "events": ["pull_request", "workflow_dispatch"], "jobs": ["free-plan", "typecheck", "quick-bun-default", "cso-macos-launcher", "macos-named-regressions", "cso-windows-launcher", "cso-docker-integration", "free-tests"], "artifact": "tested-tree", "os": "Linux", "skippable": { "jobs": ["free-plan", "typecheck", "quick-bun-default", "cso-macos-launcher", "macos-named-regressions", "cso-windows-launcher", "cso-docker-integration"], "gate": "docs-scope", "scripts": [".github/actions/docs-scope/action.yml", "bin/gstack-docs-only", "lib/docs-only.ts", "lib/review-depth.ts", "lib/ship-policy.ts", "lib/ship-policy-docs-only.ts"] } },
     "ci-reuse/windows-free-tests": { "workflow": "windows-free-tests.yml", "events": ["pull_request", "workflow_dispatch"], "jobs": ["windows-plan", "windows-free-tests"], "artifact": "tested-tree", "os": "Windows" }
   },
   "remote_gate_runs": {
@@ -29,7 +30,7 @@
     "skipped": "bun --no-env-file --config=/dev/null -e 'import { isPaidTestFile } from \"./test/helpers/paid-test-set.ts\"; import * as fs from \"node:fs\"; for (const f of fs.readFileSync(process.env.PREGATE_FILES_FILE, \"utf8\").split(/\\r?\\n/)) if (f && isPaidTestFile(f)) console.log(f);'"
   },
   "ship_lanes_from": {
-    "bun run test": { "profiles": ["ci-reuse/free-tests"], "inventory": "bun --no-env-file --config=/dev/null run scripts/test-free-shards.ts --list | sed -n 's/^  //p'" }
+    "bun run test": { "profiles": ["ci-reuse/free-tests"], "inventory": "bun --no-env-file --config=/dev/null run scripts/test-free-shards.ts --list | sed -n 's/^  //p'", "per_file": "bun --no-env-file test --timeout=30000 {files}" }
   },
   "warn": [],
   "guards": [

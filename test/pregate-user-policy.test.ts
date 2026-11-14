@@ -14,7 +14,7 @@ import * as path from 'node:path';
 import { EXIT } from '../lib/headless-artifacts';
 import { loadConfigFromUser, validateConfig } from '../lib/pregate/config';
 import { buildContext, sha256, userConfigRejection } from '../lib/pregate/context';
-import { runPregate, verifyPregate } from '../lib/pregate/index';
+import { CHECK_IDS, runPregate, verifyPregate } from '../lib/pregate/index';
 import { BASE_PREGATE, BIN, cleanup, cloneFixture, commit, fixtureTemplate, makeFixtureRepo, runBin, type FixtureRepo } from './helpers/pregate-fixture';
 import { runScriptSync } from '../lib/script-invocation';
 
@@ -88,6 +88,23 @@ describe('loadConfigFromUser', () => {
     expect(bad && 'errors' in bad ? bad.errors.map(e => e.message.startsWith('not valid JSON')) : null).toEqual([true]);
     // The JSON error names this file, not the repo copy parseConfig assumes.
     expect(bad && 'errors' in bad ? bad.errors.map(e => e.path) : null).toEqual([userPolicy]);
+  });
+});
+
+describe('fixture origin', () => {
+  // Value: protects=a push into the fixture's bare origin starts no detached auto-maintenance there, so copying the template never races
+  //   a repack (ENOENT lstat origin.git/objects/1d, Free Tests 41760556132); fails_when=the origin loses maintenance.auto=false;
+  //   why_new=local transport drops the runner's GIT_CONFIG_COUNT backstop, so only the origin's own config reaches receive-pack;
+  //   seam=none; no_claim=which maintenance task removed the object directory on the CI runner's git
+  test('a push into the origin starts no auto-maintenance even when the runner backstop is dropped', () => {
+    const { repo } = setup();
+    const trace = path.join(repo.root, 'trace2.txt');
+    const backstop = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'maintenance.auto', GIT_CONFIG_VALUE_0: 'false', GIT_CONFIG_KEY_1: 'gc.auto', GIT_CONFIG_VALUE_1: '0' };
+    const push = spawnSync('git', ['push', '-q', 'origin', 'HEAD:refs/heads/probe'], { cwd: repo.work, encoding: 'utf8', timeout: 30_000, env: { ...process.env, ...repo.env, ...backstop, GIT_TRACE2: trace } });
+    expect(push.status, push.stderr).toBe(0);
+    const events = fs.readFileSync(trace, 'utf8');
+    expect(events).toContain('receive-pack');
+    expect(events.split('\n').filter(l => l.includes('child_start') && l.includes('maintenance'))).toEqual([]);
   });
 });
 
@@ -345,7 +362,7 @@ describe('gstack-pregate with a user-owned policy', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pregate-dangle-'));
     try {
       const userPolicy = path.join(dir, 'projects', 's', 'pregate.json');
-      const record = { schema_version: 1, tree: 'T', checks: [], policy: 'defaults', policy_user_path: userPolicy, verdict: 'pass' } as any;
+      const record = { schema_version: 1, tree: 'T', checks: CHECK_IDS.map(id => ({ id, status: 'pass' })), policy: 'defaults', policy_user_path: userPolicy, verdict: 'pass' } as any;
       expect(verifyPregate(dir, record, { tree: 'T' }).ok).toBe(true);
       fs.symlinkSync(path.join(dir, 'not-yet-cloned'), path.join(dir, 'projects'));
       expect((loadConfigFromUser(userPolicy) as { errors: { code: string }[] } | null)?.errors.map(e => e.code)).toEqual(['PREGATE_CONFIG_INVALID']);
@@ -413,6 +430,7 @@ describe('gstack-pregate with a user-owned policy', () => {
     const { repo, userPolicy, run } = setup();
     const verify = () => JSON.parse(runBin(repo, 'gstack-pregate', ['verify', '--json'], { GSTACK_PROJECT_SLUG: SLUG }).out);
     writePolicy(userPolicy, { local: LOCAL_ALL });
+    expect(runBin(repo, 'gstack-pregate', ['--base', 'main', '--allow-repo-commands', '--stage', 'preflight'], { GSTACK_PROJECT_SLUG: SLUG }).status).toBe(EXIT.ok);
     expect(run().status).toBe(EXIT.ok);
     expect(verify().ok).toBe(true);
     writePolicy(userPolicy, { local: ['free-tests.yml/unit'] });

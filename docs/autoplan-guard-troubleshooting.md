@@ -22,8 +22,7 @@ Each code has one of four dispositions:
 
 **The fallback** (printed in every fallback denial):
 
-1. Run the reviews by hand: `/plan-ceo-review`, then `/plan-devex-review`,
-   then `/plan-eng-review`.
+1. Run the reviews by hand: `/plan-ceo-review`, then `/plan-devex-review`.
 2. Or move to a fresh session and keep your work: `/context-save`, start a new
    Claude Code session in the project (not `--resume`), `/context-restore`,
    then `/autoplan <plan path>`.
@@ -70,7 +69,7 @@ journal's directory is the same folder as the project, spelled differently.
 `unrecognized_shape:compaction_unreachable` means records after a Claude Code
 compaction hang from a compact boundary whose logical parent loops back
 instead of reaching the session root, in a layout gstack does not read yet
-(Claude Code 2.1.300's preserved segment is read). Earlier gstack versions
+(the preserved segments of Claude Code 2.1.300 and 2.1.317 are read). Earlier gstack versions
 dropped those records and denied the next phase with `close_incomplete`.
 Please report the detail and version.
 
